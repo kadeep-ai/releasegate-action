@@ -1,0 +1,164 @@
+name: KaDeep Release Gate
+description: Go / no-go for every PR. AI QA tests your preview URL (no account needed) or runs your KaDeep Studios release policy.
+author: Kadeep Technologies
+branding:
+  icon: check-circle
+  color: gray-dark
+
+inputs:
+  url:
+    description: Test this URL with the kadeep AI QA agent instead of running a policy (e.g. your PR preview deploy). Needs anthropic-api-key or kadeep-token.
+    required: false
+  goal:
+    description: With url, the user journey to check, e.g. "sign up and reach the dashboard". Empty explores the page and hunts for bugs.
+    required: false
+  viewport:
+    description: With url, desktop or mobile.
+    required: false
+    default: desktop
+  a11y:
+    description: With url, also run a WCAG 2.2 AA audit and fail on serious or critical violations (true or false).
+    required: false
+    default: 'false'
+  anthropic-api-key:
+    description: Anthropic API key for kadeep test (pass a secret).
+    required: false
+  kadeep-token:
+    description: KaDeep access token, to run kadeep test on KaDeep's plan (pass a secret).
+    required: false
+  ci-token:
+    description: The project's KADEEP_CI_TOKEN, for policy mode (pass a secret).
+    required: false
+  policy:
+    description: Policy file for policy mode (default releasegate.yml).
+    required: false
+  mode:
+    description: Override the policy's mode, enforce or shadow.
+    required: false
+  api:
+    description: KaDeep API URL (default https://api.kadeep.ai).
+    required: false
+  version:
+    description: npm version range of kadeep / releasegate to run.
+    required: false
+    default: '^0.4'
+  working-directory:
+    description: Directory to run in.
+    required: false
+    default: '.'
+
+outputs:
+  verdict:
+    description: pass, fail or error (url mode); go or no-go (policy mode)
+    value: ${{ steps.result.outputs.verdict }}
+  report:
+    description: Path of the report directory
+    value: ${{ steps.result.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: kadeep test
+      if: inputs.url != ''
+      id: test
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        KD_URL: ${{ inputs.url }}
+        KD_GOAL: ${{ inputs.goal }}
+        KD_VIEWPORT: ${{ inputs.viewport }}
+        KD_VERSION: ${{ inputs.version }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        KADEEP_TOKEN: ${{ inputs.kadeep-token }}
+        KADEEP_API: ${{ inputs.api }}
+      run: |
+        set +e
+        mkdir -p .kadeep/ci
+        npx -y "kadeep@${KD_VERSION}" test "$KD_URL" "$KD_GOAL" --viewport "$KD_VIEWPORT" --out .kadeep/ci/test --json > .kadeep/ci/test.json
+        code=$?
+        echo "code=$code" >> "$GITHUB_OUTPUT"
+        node -e '
+          const r = JSON.parse(require("fs").readFileSync(".kadeep/ci/test.json", "utf8"));
+          const s = [];
+          const head = r.verdict === "pass" ? "✅ PASS" : r.verdict === "fail" ? "❌ FAIL" : "⚠️ NO VERDICT";
+          s.push(`### kadeep test: ${head}`, "", r.summary ?? r.error ?? "", "");
+          for (const c of r.checks ?? []) s.push(`- ${c.passed ? "✅" : "❌"} ${c.check}`);
+          if (r.bugs?.length) { s.push("", "| Severity | Bug | Actual |", "| --- | --- | --- |"); for (const b of r.bugs) s.push(`| ${b.severity} | ${b.title} | ${(b.actual ?? "").replace(/\|/g, "\\|")} |`); }
+          if (r.console?.length || r.network?.length) s.push("", `${r.console?.length ?? 0} console errors, ${r.network?.length ?? 0} failed requests. Screenshots and report.json are in the kadeep-report artifact.`);
+          require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, s.join("\n") + "\n");
+          for (const b of r.bugs ?? []) console.log(`::${b.severity === "minor" ? "warning" : "error"} title=kadeep: ${b.title}::${(b.actual ?? "").replace(/\n/g, " ")}`);
+          require("fs").appendFileSync(process.env.GITHUB_OUTPUT, `verdict=${r.verdict ?? "error"}\n`);
+        ' || echo "verdict=error" >> "$GITHUB_OUTPUT"
+
+    - name: kadeep a11y
+      if: inputs.url != '' && inputs.a11y == 'true'
+      id: a11y
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        KD_URL: ${{ inputs.url }}
+        KD_VIEWPORT: ${{ inputs.viewport }}
+        KD_VERSION: ${{ inputs.version }}
+      run: |
+        set +e
+        npx -y "kadeep@${KD_VERSION}" a11y "$KD_URL" --viewport "$KD_VIEWPORT" --out .kadeep/ci/a11y > .kadeep/ci/a11y.txt
+        code=$?
+        { echo "### kadeep a11y (WCAG 2.2 AA)"; echo; echo '```'; cat .kadeep/ci/a11y.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+        echo "code=$code" >> "$GITHUB_OUTPUT"
+
+    - name: releasegate
+      if: inputs.url == ''
+      id: gate
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        KD_VERSION: ${{ inputs.version }}
+        KD_POLICY: ${{ inputs.policy }}
+        KD_MODE: ${{ inputs.mode }}
+        KADEEP_CI_TOKEN: ${{ inputs.ci-token }}
+        KADEEP_API: ${{ inputs.api }}
+      run: |
+        set +e
+        args=()
+        [ -n "$KD_POLICY" ] && args+=(--policy "$KD_POLICY")
+        [ -n "$KD_MODE" ] && args+=(--mode "$KD_MODE")
+        npx -y "releasegate@${KD_VERSION}" "${args[@]}"
+        code=$?
+        echo "code=$code" >> "$GITHUB_OUTPUT"
+        [ "$code" = "0" ] && echo "verdict=go" >> "$GITHUB_OUTPUT" || echo "verdict=no-go" >> "$GITHUB_OUTPUT"
+
+    - name: Result
+      id: result
+      shell: bash
+      env:
+        T_VERDICT: ${{ steps.test.outputs.verdict }}
+        G_VERDICT: ${{ steps.gate.outputs.verdict }}
+        T_CODE: ${{ steps.test.outputs.code }}
+        A_CODE: ${{ steps.a11y.outputs.code }}
+        G_CODE: ${{ steps.gate.outputs.code }}
+        URL_MODE: ${{ inputs.url != '' }}
+        WD: ${{ inputs.working-directory }}
+      run: |
+        if [ "$URL_MODE" = "true" ]; then
+          echo "verdict=${T_VERDICT:-error}" >> "$GITHUB_OUTPUT"
+          echo "report=$WD/.kadeep/ci" >> "$GITHUB_OUTPUT"
+          [ "${T_CODE:-1}" = "0" ] && [ "${A_CODE:-0}" = "0" ] && exit 0
+          exit 1
+        fi
+        echo "verdict=$G_VERDICT" >> "$GITHUB_OUTPUT"
+        echo "report=$WD/.releasegate" >> "$GITHUB_OUTPUT"
+        exit "${G_CODE:-1}"
+
+    - name: Upload the report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kadeep-report
+        path: |
+          ${{ inputs.working-directory }}/.kadeep/ci
+          ${{ inputs.working-directory }}/.releasegate
+        if-no-files-found: ignore
